@@ -1,0 +1,301 @@
+# H563 UDS OTA Bootloader Example
+
+This example implements a production-style dual-bank OTA bootloader for the
+STM32H563 using UDSLib.  The bootloader lives in the first 96 KB of each
+flash bank, validates the active-bank application image on every boot, and
+falls back to a UDS programming session when no valid image is present.  A
+separate host tool (`host/`) drives the full download sequence over
+SocketCAN CAN-FD.  Three minimal demo applications (`app/`) serve as
+upgrade targets:
+- **App A** (bank 0) — healthy app; calls `boot_confirm()` on startup.
+- **App B-good** — healthy app; calls `boot_confirm()` on startup.
+- **App B-bad** — demonstrates rollback: prints a banner but deliberately
+  skips `boot_confirm()`, triggering automatic rollback after
+  `MAX_BOOT_ATTEMPTS` failed attempts.
+
+AES-128-CMAC (mbedTLS 3.6, RFC 4493) authenticates the 0x27 Security
+Access exchange before any reprogramming is permitted.
+
+## Memory Map
+
+The STM32H563 has two 1 MB flash banks.  The bootloader occupies the first
+96 KB of whichever bank is active; the application region starts at offset
+`+0x18000` within the same bank.  The OTA image header sits at the very
+start of the application region, followed by a 0x3F0-byte reserved pad so
+the Cortex-M33 vector table (which requires 1 KB alignment on H563) lands at
+`+0x400`.
+
+```
+Flash address    Bank 0              Bank 1
+0x08000000  ┌──────────────┐   0x08100000  ┌──────────────┐
+            │  Bootloader  │               │  Bootloader  │
+            │ (sectors 0-  │               │ (sectors 0-  │
+            │  10, ~88 KB) │               │  10, ~88 KB) │
+0x08016000  ├──────────────┤   0x08116000  ├──────────────┤
+            │  Boot-state  │               │  Boot-state  │
+            │ (sector 11,  │               │ (sector 11,  │
+            │   8 KB)      │               │   8 KB)      │
+0x08018000  ├──────────────┤   0x08118000  ├──────────────┤
++0x000      │ OTA header   │  +0x000       │ OTA header   │
+            │  (16 bytes)  │               │  (16 bytes)  │
++0x010      │ Reserved pad │  +0x010       │ Reserved pad │
+            │  (0x3F0 B)   │               │  (0x3F0 B)   │
++0x400      │ App vector   │  +0x400       │ App vector   │
+            │ table + code │               │ table + code │
+            │ (payload,    │               │ (payload,    │
+            │  image_size) │               │  image_size) │
++0x400      │ RSA-2048     │  +0x400       │ RSA-2048     │
++image_size │ signature    │  +image_size  │ signature    │
+            │  (256 bytes) │               │  (256 bytes) │
+0x08100000  └──────────────┘   0x08200000  └──────────────┘
+```
+
+The 256-byte RSA-2048 PKCS#1 v1.5 signature is appended immediately after the
+payload; its offset is derived from `image_size`, so no header field is needed.
+See the secure-boot section below.
+
+Each bank base (`0x08000000` or `0x08100000`) hosts an identical bootloader
+image.  The active bank is selected by the H5 FLASH option bytes; the
+bootloader reads `FLASH->OPTSR_CUR.SWAP_BANK` at runtime via
+`flash_active_bank()` to locate both the active-bank application (to jump
+to) and the inactive-bank application region (the OTA download target).
+
+## RoutineControl IDs (SID 0x31)
+
+All routines require programming session (0x10 02) and security access (0x27).
+
+| Routine ID | Name | Description |
+|---|---|---|
+| 0xFF00 | EraseMemory | Erase the inactive-bank app sectors (alternative to the erase done in RequestDownload). |
+| 0xFF01 | CheckProgrammingDependencies | Validate OTA image header + CRC-32 over payload + RSA-2048 signature; returns `0x01` on pass. |
+| 0xFF02 | ActivateSoftware | Re-validate the inactive image (CRC + signature), mark bank pending, then `flash_swap_to_bank_and_reset()` — does not return. |
+| 0xFF03 | PerformRollback | Tester-commanded revert to the other (currently inactive) bank — see note below. |
+
+### Automatic vs tester-commanded rollback
+
+The bootloader has **two independent rollback mechanisms**:
+
+1. **Automatic boot-confirm rollback** — fires entirely without tester
+   involvement.  When ActivateSoftware (0xFF02) swaps to a new image, the
+   bootloader marks that bank *pending*.  If the new app fails to call
+   `boot_confirm()` within `MAX_BOOT_ATTEMPTS` boot attempts (e.g. it crashes
+   or hangs before confirming), the bootloader automatically swaps back to the
+   previous known-good bank on the next boot.
+
+2. **Tester-commanded rollback (0xFF03 PerformRollback)** — a diagnostic
+   tool explicitly asks the ECU to revert.  This is useful when the newly
+   activated app *did* confirm itself (automatic rollback will not trigger),
+   but the tester still needs to revert — for example, a field recall or a
+   verification failure discovered after boot.
+
+   The routine first validates the other bank's image via `app_is_valid()`;
+   if the other bank holds no valid image the request is rejected with
+   `0x22 conditionsNotCorrect` to prevent bricking.  If valid, the other
+   bank's boot-state is cleared (confirmed), and `flash_swap_to_bank_and_reset()`
+   selects that bank and resets.
+
+   The host flash tool supports this mode:
+   ```sh
+   host/flash_tool can0 --rollback
+   ```
+
+## Image authenticity (secure boot)
+
+CRC-32 alone is forgeable: anyone past SecurityAccess could flash arbitrary
+code that still passes the CRC. The bootloader therefore also verifies an
+**RSA-2048 PKCS#1 v1.5 signature** over the image, baking the public key into the
+bootloader so only images signed with the matching private key are accepted.
+The CRC is kept as a fast integrity check (defense in depth).
+
+RSA-2048 verify is `m^65537 mod n` — roughly 100x cheaper than an ECDSA-P256
+verify, and it completes well under the simulator's hard 50M-instruction cap.
+It is also the standard scheme for on-device secure boot.
+
+- **Scheme / hash:** RSA-2048, PKCS#1 v1.5 over SHA-256 of the payload bytes
+  (the same bytes the CRC covers, `[+0x400 .. +0x400+image_size)`).
+- **Signature:** 256 raw big-endian bytes appended immediately after the
+  payload. The device verifies it with `mbedtls_rsa_pkcs1_verify`.
+- **Enforcement:** the signature is checked in `app_is_valid()`, so it gates
+  every path that calls it: boot-time validation, `0xFF01` CheckProgramming,
+  the `0xFF02` ActivateSoftware re-validation just before the bank swap, and
+  `0xFF03` PerformRollback. A forged-but-CRC-good image fails.
+- **Keys:** the baked public key lives in `bootloader/image_pubkey.h`
+  (modulus `n`, 256 bytes, plus exponent `e = 65537`). The matching private key
+  `app/signing_key_dev.pem` is committed so the example is self-contained.
+
+  > **DEMO KEYS — DO NOT SHIP.** `app/signing_key_dev.pem` is a development
+  > signing key committed for this example only. A real product NEVER commits
+  > its signing key: it lives in an HSM or an offline signing service, and only
+  > the public half is baked into the bootloader.
+
+The crypto is independently provable on the host (no MCU):
+```sh
+make -C bootloader rsa-test   # verifies signed image; proves tamper is rejected
+```
+
+## OTA Sequence
+
+The host flash tool (`host/flash_tool`) drives these UDS steps:
+
+1. **0x10 02** — DiagnosticSessionControl(programming): switches to the
+   programming session, which gates all reprogramming services.
+2. **0x85 02** — ControlDTCSetting(off): freezes DTC storage so the faults
+   that erasing/flashing naturally provokes are not logged.  Returning to the
+   default session (`0x10 01`) re-enables it automatically.
+3. **0x28 03 01** — CommunicationControl(disableRxAndTx, application): quiets
+   normal application messaging on the bus for the duration of the flash.
+   Also restored on return to the default session.
+4. **0x22 F1A0** — ReadDataByIdentifier(active-bank DID): reads a 1-byte
+   indicator (`0` or `1`) so the host can compute the inactive-bank base
+   address for the download.
+5. **0x27 01** — SecurityAccess(requestSeed): bootloader sends a 16-byte
+   nonce (fixed demo seed; see Limitations).
+6. **0x27 02** — SecurityAccess(sendKey): host replies with
+   AES-128-CMAC(DEMO\_SECRET, seed); bootloader verifies constant-time.
+7. **0x34** — RequestDownload: specifies the inactive-bank app base address
+   and the image size (OTA header + payload).  Bootloader erases the
+   inactive app sectors and arms the transfer state.
+8. **0x36 × N** — TransferData: image bytes in chunks.  The bootloader
+   accumulates them in a 16-byte staging buffer (H5 requires quad-word
+   aligned program operations) and flushes full blocks to flash.
+9. **0x37** — RequestTransferExit: flushes the final staging buffer (padded
+   with `0xFF`).
+10. **0x31 01 FF01** — RoutineControl(CheckProgrammingDependencies): runs the
+   same `app_is_valid()` check the bootloader uses at boot (magic,
+   `image_size`, CRC-32/ISO-HDLC over payload, initial SP in RAM).  Returns
+   `0x01` on pass.
+11. **0x31 01 FF02** — RoutineControl(ActivateSoftware): calls
+   `flash_set_swap_and_reset()`, which sets `SWAP_BANK` in the H5 option
+   bytes and issues a system reset.  The bootloader in the new active bank
+   validates the image and jumps to it.
+
+## Building
+
+### Prerequisites
+
+- `arm-none-eabi-gcc` 13.x (with `nano.specs` / `nosys.specs`, i.e. newlib-nano)
+- `python3` (for `mkimage.py`)
+- `gcc` (host) + `libmbedtls-dev` (for the host flash tool;
+  Debian/Ubuntu: `sudo apt install libmbedtls-dev`)
+
+### Bootloader
+
+```sh
+UDSLIB_DIR=<path-to-udslib-checkout> make -C bootloader
+```
+
+Produces `bootloader/build/h563_uds_bootloader.elf`.
+
+`MBEDTLS_DIR` defaults to
+`$(UDSLIB_DIR)/zephyr-workspace/modules/crypto/mbedtls-3.6` (the copy
+vendored in the udslib Zephyr workspace) and can be overridden:
+
+```sh
+UDSLIB_DIR=~/projects/udslib MBEDTLS_DIR=/opt/mbedtls-3.6 make -C bootloader
+```
+
+Host unit tests (run on the build machine, no cross-compiler needed):
+
+```sh
+UDSLIB_DIR=<path> make -C bootloader cmac-test       # RFC 4493 AES-CMAC vectors
+UDSLIB_DIR=<path> make -C bootloader rsa-test        # RSA-2048 image signature + tamper
+UDSLIB_DIR=<path> make -C bootloader image-test      # OTA image header/CRC logic
+UDSLIB_DIR=<path> make -C bootloader bootstate-test  # boot-state decision FSM
+```
+
+### Demo Applications (App A / App B-good / App B-bad / App B-sig-bad)
+
+```sh
+make -C app all-four    # builds all four variants
+# or individually:
+make -C app APP=A        # App A (healthy, confirms)
+make -C app APP=B        # App B-good (healthy, confirms)
+make -C app APP=Bbad     # App B-bad (unhealthy, no confirm → rollback demo)
+make -C app APP=Bsigbad  # App B payload, CRC-good but signature TAMPERED → fails verify
+```
+
+Produces in `app/`:
+- `app_a.elf`, `app_a.bin`, `app_a_image.bin` (version 0x00010000)
+- `app_b.elf`, `app_b.bin`, `app_b_image.bin` (version 0x00020000)
+- `app_bbad.elf`, `app_bbad.bin`, `app_bbad_image.bin` (version 0x00020000)
+- `app_bsigbad_image.bin` (App B payload, CRC valid, signature tampered — for
+  negative secure-boot tests; must FAIL `0xFF01` / `app_is_valid()`)
+
+Each image is a raw binary wrapped by `mkimage.py` into the OTA format
+(0x400-byte header + payload + 256-byte RSA-2048 PKCS#1 v1.5 signature, signed
+with `app/signing_key_dev.pem`).  To cross-check the image:
+
+```sh
+make -C app image-verify   # validates app_b_image.bin via bootloader logic
+```
+
+### Host Flash Tool
+
+```sh
+make -C host
+```
+
+Produces `host/flash_tool`.  Requires `libmbedtls-dev` for AES-CMAC.
+
+To flash App B over real CAN hardware (e.g. PCAN adapter):
+
+```sh
+sudo ip link set can0 up type can bitrate 500000 dbitrate 2000000 fd on
+host/flash_tool can0 app/app_b_image.bin
+```
+
+## Validation
+
+| Gate | How |
+|---|---|
+| Bootloader compiles | `UDSLIB_DIR=. make -C bootloader` |
+| AES-CMAC RFC 4493 vectors | `make -C bootloader cmac-test` (host, no MCU) |
+| RSA-2048 image signature + tamper rejection | `make -C bootloader rsa-test` (host, no MCU) |
+| OTA image header/CRC logic | `make -C bootloader image-test` (host, no MCU) |
+| Boot-state decision FSM | `make -C bootloader bootstate-test` (host, no MCU) |
+| App B image well-formed | `make -C app image-verify` (host, no MCU) |
+| Host tool CAN-FD framing | `host/test_vcan.sh` (requires `vcan` kernel module) |
+| Full download → swap → boot loop | Validated in the labwired-core STM32H563 simulation (see w1ne/labwired-core#326); requires a simulated H563 environment |
+| Live host ↔ ECU over real CAN | Manual: `host/flash_tool can0 app/app_b_image.bin` (requires CAN hardware, e.g. PCAN) |
+
+## Limitations
+
+**a. Same-bank flash erase requires RAM execution on real H5 silicon.**
+Both the bootloader (`boot_state_bump_attempts`, `boot_state_clear`) and the
+app (`boot_confirm`) erase sector 11 of the bank the CPU is executing from.
+On real STM32H563 silicon, RM0481 §7.3.4 prohibits reading from a bank while
+it is being erased ("read-while-write" constraint).  The code MUST be copied
+to ITCM or SRAM and executed from there before issuing the flash erase.  In
+the LabWired H563 simulator this constraint is not enforced and the operations
+complete correctly from flash.  Do not port this code to real silicon without
+adding the RAM-execute wrapper.
+
+**b. Boot-state updates are torn-write-safe.**
+The activate/boot critical path never erases: the inactive bank's boot-state
+sector is pre-erased during the OTA ERASE phase (`erase_app_sectors()` /
+0xFF00), so `boot_state_mark_pending()` is a single atomic H5 quad-word
+PROGRAM, and each trial boot PROGRAMs one additional pre-erased attempt slot
+rather than rewriting a counter.  An H5 quad-word commits atomically (the
+write buffer flushes only on the 16th byte), so a power loss either commits a
+full record or nothing — it can never erase the pending flag mid-update nor
+make an unconfirmed bank look confirmed.  The attempt count is the number of
+programmed slots in the sector; see the layout in `boot_state.h`.
+
+**c. `uart_init` does not configure RCC or GPIO.**
+The UART output (`BL-START`, `BL-JUMP`, etc.) works in the labwired-core
+simulation because the simulator pre-initializes peripherals, but on real
+silicon `uart_init` must additionally enable the USART clock via RCC and
+configure the TX/RX alternate-function GPIO pins before the UART is usable.
+
+**d. The 0x27 secret and seed are fixed demo values.**
+`DEMO_SECRET` and `DEMO_SEED` in `bootloader/main.c` and
+`host/flash_tool.c` are hard-coded example constants.  In a production ECU
+the key must not reside in flash in the clear; derive it from an HSM or SHE
+key slot.  The seed must be a TRNG-derived per-attempt nonce, not a fixed
+value.
+
+**e. The vcan end-to-end host ↔ ECU harness is not wired.**
+`host/test_vcan.sh` verifies ISO-TP frame construction on a loopback vcan
+interface but does not run a stub ECU responder.  Frame logic is unit-tested;
+the real validation path for the full protocol exchange is either the
+labwired-core simulation (see above) or real CAN hardware.

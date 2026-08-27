@@ -1,0 +1,133 @@
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(CMOCKA REQUIRED cmocka)
+
+include_directories(${CMOCKA_INCLUDE_DIRS})
+
+macro(add_uds_test name source)
+    add_executable(${name} ${source} unit/test_helpers.c)
+    target_link_libraries(${name} uds ${CMOCKA_LIBRARIES})
+    add_test(NAME ${name} COMMAND ${name})
+endmacro()
+
+add_uds_test(test_core test_core.c)
+add_uds_test(test_service_10 unit/test_service_10.c)
+add_uds_test(test_service_22 unit/test_service_22.c)
+add_uds_test(test_service_27 unit/test_service_27.c)
+add_uds_test(test_service_3E unit/test_service_3E.c)
+add_uds_test(test_service_11 unit/test_service_11.c)
+add_uds_test(test_service_28 unit/test_service_28.c)
+add_uds_test(test_service_85 unit/test_service_85.c)
+add_uds_test(test_service_did unit/test_service_did.c)
+add_uds_test(test_timing unit/test_timing.c)
+add_uds_test(test_service_29 unit/test_service_29.c)
+add_uds_test(test_service_dtc unit/test_service_dtc.c)
+add_uds_test(test_dtc_helpers unit/test_dtc_helpers.c)
+add_uds_test(test_dtc_store unit/test_dtc_store.c)
+add_uds_test(test_service_84 unit/test_service_84.c)
+add_uds_test(test_service_24 unit/test_service_24.c)
+add_uds_test(test_service_38 unit/test_service_38.c)
+add_uds_test(test_service_2C unit/test_service_2C.c)
+add_uds_test(test_service_86 unit/test_service_86.c)
+add_uds_test(test_service_flash unit/test_service_flash.c)
+add_uds_test(test_service_mem unit/test_service_mem.c)
+add_uds_test(test_osal unit/test_osal.c)
+add_uds_test(test_endian unit/test_endian.c)
+add_uds_test(test_fuzz_core unit/test_fuzz_core.c)
+add_uds_test(test_transport unit/test_transport.c)
+target_link_options(test_transport PRIVATE -Wl,--wrap=uds_input_sdu)
+add_uds_test(test_service_negative unit/test_service_negative.c)
+add_uds_test(test_tp_flow_control unit/test_tp_flow_control.c)
+add_uds_test(test_tp_isolation unit/test_tp_isolation.c)
+add_uds_test(test_tp_isotp_canfd unit/test_tp_isotp_canfd.c)
+target_link_options(test_tp_isotp_canfd PRIVATE -Wl,--wrap=uds_input_sdu)
+add_uds_test(test_tp_isotp_integration unit/test_tp_isotp_integration.c)
+target_link_options(test_tp_isotp_integration PRIVATE -Wl,--wrap=uds_input_sdu)
+add_uds_test(test_tp_padding unit/test_tp_padding.c)
+target_link_options(test_tp_padding PRIVATE -Wl,--wrap=uds_input_sdu)
+add_uds_test(test_tp_isotp_escape_fc unit/test_tp_isotp_escape_fc.c)
+target_link_options(test_tp_isotp_escape_fc PRIVATE -Wl,--wrap=uds_input_sdu)
+add_uds_test(test_tp_full_duplex unit/test_tp_full_duplex.c)
+target_link_options(test_tp_full_duplex PRIVATE -Wl,--wrap=uds_input_sdu)
+add_uds_test(test_tp_timeout unit/test_tp_timeout.c)
+add_uds_test(test_nrc_priority unit/test_nrc_priority.c)
+add_uds_test(test_concurrency unit/test_concurrency.c)
+add_uds_test(test_role_isolation unit/test_role_isolation.c)
+add_uds_test(test_client unit/test_client.c)
+add_uds_test(test_tp_isotp_net_hardening unit/test_tp_isotp_net_hardening.c)
+add_uds_test(test_tp_isotp_coverage unit/test_tp_isotp_coverage.c)
+add_uds_test(test_service_coverage3 unit/test_service_coverage3.c)
+add_uds_test(test_service_coverage2 unit/test_service_coverage2.c)
+add_uds_test(test_service_coverage unit/test_service_coverage.c)
+add_uds_test(test_sequences unit/test_sequences.c)
+add_uds_test(test_nrc_priority_a3 unit/test_nrc_priority_a3.c)
+add_uds_test(test_doc_behaviours unit/test_doc_behaviours.c)
+add_uds_test(test_core_coverage unit/test_core_coverage.c)
+add_uds_test(test_service_2E unit/test_service_2E.c)
+add_uds_test(test_safety_gate unit/test_safety_gate.c)
+add_uds_test(test_async unit/test_async.c)
+add_uds_test(test_nvm_persistence unit/test_nvm_persistence.c)
+add_uds_test(test_compliance_suppress unit/test_compliance_suppress.c)
+add_uds_test(test_service_10_prog unit/test_service_10_prog.c)
+add_uds_test(test_service_34_flex unit/test_service_34_flex.c)
+add_uds_test(test_rcrrp_limit unit/test_rcrrp_limit.c)
+add_uds_test(test_compliance_pass2 unit/test_compliance_pass2.c)
+add_uds_test(test_service_2A unit/test_service_2A.c)
+add_uds_test(test_service_87 unit/test_service_87.c)
+add_uds_test(test_service_83 unit/test_service_83.c)
+add_uds_test(test_session_policy unit/test_session_policy.c)
+
+# Smoke-test the end-to-end reprogramming demo (built in examples/).
+add_test(NAME flash_demo COMMAND pro_flash_tool)
+add_uds_test(test_service_2F unit/test_service_2F.c)
+add_uds_test(test_service_35 unit/test_service_35.c)
+
+# Manual definition for pass3 to allow custom mocks (avoiding test_helpers.c link)
+add_executable(test_compliance_pass3 unit/test_compliance_pass3.c)
+target_link_libraries(test_compliance_pass3 uds ${CMOCKA_LIBRARIES})
+add_test(NAME test_compliance_pass3 COMMAND test_compliance_pass3)
+
+add_uds_test(test_integration integration/test_integration.c)
+
+# Regression for issue #29: multi-frame request must be dispatched (full stack,
+# real uds_input_sdu — intentionally NOT wrapped).
+add_uds_test(test_issue29_multiframe_request unit/test_issue29_multiframe_request.c)
+
+# Regression for issue #42: full-duplex inbound frame must not abort an
+# in-flight multi-frame response (full stack, real uds_input_sdu).
+add_uds_test(test_issue42_full_duplex_response unit/test_issue42_full_duplex_response.c)
+
+add_uds_test(test_addressing_dispatch unit/test_addressing_dispatch.c)
+add_uds_test(test_tp_addressing unit/test_tp_addressing.c)
+target_link_options(test_tp_addressing PRIVATE -Wl,--wrap=uds_input_sdu -Wl,--wrap=uds_input_sdu_addr)
+
+# Regression for issue #42 part 2: functional addressing end to end.
+add_uds_test(test_issue42_functional unit/test_issue42_functional.c)
+
+# §2b hardening: enforce minimum buffer sizes at uds_init().
+add_uds_test(test_init_validation unit/test_init_validation.c)
+
+# §5a hardening: P2/P2* single source of truth regression.
+add_uds_test(test_p2_single_source unit/test_p2_single_source.c)
+
+# §5b hardening: configurable S3 session timeout regression.
+add_uds_test(test_s3_configurable unit/test_s3_configurable.c)
+
+# §5c hardening: expose receiver Block Size / STmin via setters.
+add_uds_test(test_tp_bs_stmin_setters unit/test_tp_bs_stmin_setters.c)
+
+# §1 concurrency: host pthreads stress test for the lock-scope refactor (fn_tp_send
+# moved out of the critical section; cross-context ctx fields made volatile).
+# Optional and OFF by default: it is not part of the core gate. Enable with
+# -DUDS_BUILD_STRESS_TESTS=ON, ideally under ThreadSanitizer
+# (-DCMAKE_C_FLAGS="-fsanitize=thread"), to look for data races on the shared ctx.
+option(UDS_BUILD_STRESS_TESTS "Build the pthreads concurrency stress test" OFF)
+if(UDS_BUILD_STRESS_TESTS)
+    find_package(Threads)
+    if(Threads_FOUND)
+        add_executable(test_concurrency_stress unit/test_concurrency_stress.c)
+        target_link_libraries(test_concurrency_stress uds Threads::Threads)
+        add_test(NAME test_concurrency_stress COMMAND test_concurrency_stress)
+    else()
+        message(STATUS "Threads not found: skipping test_concurrency_stress")
+    endif()
+endif()

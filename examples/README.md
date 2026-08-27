@@ -1,0 +1,47 @@
+# Examples
+
+Worked examples for integrating LibUDS. The host examples below build with a
+plain `gcc` and run on your machine — `cd` into one and run `make run`.
+
+## Runnable host demos (`make run`)
+
+`cd` into one and run `make run`. Each prints its response bytes to stdout and
+exits non-zero on an unexpected (non-positive) response, so it doubles as a
+smoke test.
+
+| Example | Shows |
+|---------|-------|
+| [`custom_service`](custom_service/) | Add a manufacturer-specific service (or override a built-in) via `config.user_services`, without editing the library. |
+| [`auth_challenge`](auth_challenge/) | Wire the Authentication service (0x29) challenge/response flow (no crypto dependency). |
+| [`auth_challenge_mbedtls`](auth_challenge_mbedtls/) | The same 0x29 flow with **real AES-128-CMAC** behind `fn_auth` — builds against mbedTLS (`make`) or wolfSSL (`make CRYPTO=wolfssl`), byte-identical output. |
+| [`security_access_mbedtls`](security_access_mbedtls/) | Security Access (0x27) deriving the key from the seed with **real AES-128-CMAC** behind `fn_security_seed` / `fn_security_key` — two security levels, two key sets; mbedTLS or wolfSSL. |
+| [`dtc_store`](dtc_store/) | Manage DTC instances with the opt-in reference store and answer ReadDTCInformation (0x19) end-to-end. |
+| [`dtc_clear`](dtc_clear/) | Implement the ClearDiagnosticInformation (0x14) `fn_dtc_clear` hook by hand — group-all vs. specific-group, with conditionsNotCorrect / requestOutOfRange NRCs. |
+| [`dtc_full_coverage`](dtc_full_coverage/) | Every 0x19 sub-function — library-framed and application-served — plus 0x04/0x06 freeze-frame payloads. |
+
+## Other host examples (`make`, then run the binary)
+
+| Example | Shows |
+|---------|-------|
+| [`host_sim`](host_sim/) | A full UDS server simulator exercising many services; used by the Python integration tests. |
+| [`client_demo`](client_demo/) | Drive a server from the UDS client API. |
+
+## Integration templates
+
+| Example | Target |
+|---------|--------|
+| [`bare_metal`](bare_metal/) | Bare-metal super-loop integration skeleton. |
+| [`freertos_demo`](freertos_demo/) | Task-based FreeRTOS integration skeleton. |
+| [`zephyr_uds_server`](zephyr_uds_server/) | Zephyr application (build with `west`); see [`../docs/QUICKSTART_ZEPHYR.md`](../docs/QUICKSTART_ZEPHYR.md). |
+| [`pro_flash_tool`](pro_flash_tool/) | End-to-end ECU reprogramming client walking the canonical **17-step** UDS flash sequence (session → DTC off → comm off → unlock → fingerprint → erase → download → checkMemory → reset → restore); see its [README](pro_flash_tool/README.md) for the STM32F103 + bxCAN mapping. |
+| [`f103_cubemx_uds_ecu`](f103_cubemx_uds_ecu/) | STM32F103C8 (Blue Pill) **CubeMX / HAL** UDS ECU — ISO-TP over **bxCAN**, real `HAL_FLASH` erase/program + hardware CRC; the on-target counterpart to `pro_flash_tool`. Re-openable `.ioc`; HAL not vendored (generate from CubeMX or clone ST repos). |
+
+## Generated artifacts
+
+| Path | Contents |
+|------|----------|
+| [`generated/`](generated/) | Example DID table auto-generated from ODX. |
+| [`generated_tests/`](generated_tests/) | Generated Python service tests. |
+
+See [`../docs/INTEGRATION_GUIDE.md`](../docs/INTEGRATION_GUIDE.md) for a full
+integration walkthrough.

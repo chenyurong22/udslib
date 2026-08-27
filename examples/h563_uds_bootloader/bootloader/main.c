@@ -1,0 +1,978 @@
+/*
+ * Copyright (c) 2026 Andrii Shylenko
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ */
+
+/**
+ * @file main.c
+ * @brief STM32H563 UDS OTA Bootloader — server wiring (Task 3b/4)
+ *
+ * Boot flow:
+ *   1. Print "BL-START" on UART.
+ *   2. Validate active-bank app image (ota_image_header_t at app_base).
+ *      If valid  → print "BL-JUMP"     then app_jump() (does not return).
+ *      If invalid→ print "BL-RECOVERY" then fall through to UDS server loop.
+ *   3. Start FDCAN loopback, init ISO-TP FD, configure UDS server.
+ *   4. Run polling loop: pump RX → uds_process → uds_tp_isotp_process.
+ *
+ * UDS server features wired here:
+ *   - restrict_sessions=true: reprogramming services gated to programming
+ *     session (SID 0x10 sub 0x02).
+ *   - SID 0x27 security access via AES-128-CMAC (demo key — see DEMO_SECRET).
+ *   - SID 0x34 RequestDownload: validates inactive-bank app region, erases sectors.
+ *   - SID 0x36 TransferData: programs 16-byte-aligned chunks via flash_h5.
+ *   - SID 0x37 RequestTransferExit: flushes the staging buffer.
+ *   - SID 0x31 RoutineControl:
+ *       0xFF00 EraseMemory       — erase the inactive-bank app sectors (alt path).
+ *       0xFF01 CheckProgramming  — validates image header + CRC-32 over payload.
+ *       0xFF02 ActivateSoftware  — flash_swap_to_bank_and_reset(inactive) (no return).
+ *       0xFF03 PerformRollback   — tester-commanded revert to the other bank;
+ *                                  validates the other bank before swapping (does not return).
+ *
+ * Flash layout (dual-bank, 1 MB per bank, 8 KB sectors):
+ *   Bank 0 base: 0x08000000   Bank 1 base: 0x08100000
+ *   Bootloader:  sectors 0-11 (0x00000–0x17FFF, 96 KB)
+ *   App region:  sectors 12-127 (0x18000–0xFFFFF, 928 KB)
+ *
+ * Active-bank app base = bank_base + 0x18000
+ * (bank_base = 0x08000000 if active==0, 0x08100000 if active==1)
+ *
+ * OTA image format (ota_image.h):
+ *   [app_base+0x000 .. +0x010)  ota_image_header_t (magic, image_size, crc32, version)
+ *   [app_base+0x010 .. +0x400)  RESERVED padding (0xFF)
+ *   [app_base+0x400 .. )        app payload; Cortex-M vector table at app_base+0x400
+ *   CRC-32/ISO-HDLC covers only the payload bytes (not the header/padding).
+ *   All fields are little-endian.
+ *
+ * 16-byte staging buffer for TransferData:
+ *   The H5 flash controller requires 16-byte (quad-word) aligned writes.
+ *   fn_transfer_data accumulates data in g_stage[] and flushes on full block or
+ *   on fn_transfer_exit (padded with 0xFF to 16 bytes).
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "app_jump.h"
+#include "boot_state.h"
+#include "fdcan.h"
+#include "flash_h5.h"
+#include "ota_crc.h"
+#include "ota_image.h"
+#include "sec_cmac.h"
+#include "stm32h563xx.h"
+#include "stm32h5xx_ll_bus.h"
+#include "stm32h5xx_ll_rng.h"
+#include "uds/uds_core.h"
+#include "uds/uds_isotp.h"
+#ifdef SIM_OTA_TESTER
+#include "../sim_tester/sim_tester.h"
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Timing — Cortex-M33 SysTick 1 ms time base
+ *
+ * g_now_ms is incremented once per millisecond by SysTick_Handler (the modeled
+ * exception #15), NOT by the main loop.  This makes cfg.security_delay_ms and
+ * cfg.p2_star_ms real wall-clock milliseconds: the brute-force lockout in 0x27
+ * Security Access is an actual time delay rather than a loop-iteration count.
+ *
+ * The firmware does not configure RCC, so the core runs at the H563 reset
+ * clock.  On STM32H5 the reset clock source is HSI = 32 MHz, undivided in the
+ * reset configuration, so SystemCoreClock at reset is 32 MHz.  Exact
+ * wall-clock fidelity is not required here; a monotonic ms tick driven by a
+ * hardware timer is the goal.
+ * ------------------------------------------------------------------------- */
+
+/* H563 reset core clock: HSI = 32 MHz (undivided in the reset RCC config). */
+#define CORE_CLOCK_HZ 32000000u
+
+static volatile uint32_t g_now_ms;
+
+/* SysTick exception (#15): advance the millisecond time base. */
+void SysTick_Handler(void)
+{
+    ++g_now_ms;
+}
+
+/* Configure SysTick for a 1 ms tick from the processor clock.
+ *
+ * CMSIS SysTick_Config(ticks) programs the SysTick (SCS) registers via the
+ * CMSIS core_cm33.h SysTick struct: RVR = ticks - 1, CVR = 0, and CSR =
+ * CLKSOURCE | TICKINT | ENABLE — exactly the 1 ms period and processor-clock
+ * source used here. */
+static void systick_init(void)
+{
+    (void) SysTick_Config(CORE_CLOCK_HZ / 1000u);
+}
+
+static uint32_t get_time_ms(void)
+{
+    return g_now_ms;
+}
+
+/* ---------------------------------------------------------------------------
+ * CAN / ISO-TP
+ * ------------------------------------------------------------------------- */
+#define BL_TX_ID 0x7E8u
+#define BL_RX_ID 0x7E0u
+
+static uds_isotp_ctx_t g_isotp;
+static uint8_t g_isotp_tx_sdu[512];
+
+static int isotp_send_adapter(struct uds_ctx *ctx, const uint8_t *data, uint16_t len)
+{
+    (void) ctx;
+    return uds_isotp_send(&g_isotp, data, len);
+}
+
+/* ---------------------------------------------------------------------------
+ * Security Access 0x27 — AES-128-CMAC
+ *
+ * DEMO_SECRET is a fixed 16-byte example key only.  On a production ECU this
+ * must NOT reside in flash: replace with a key handle into the HSM/SHE, making
+ * aes_cmac() an HSM call.  The seed is a fresh per-attempt nonce drawn from the
+ * H563 hardware TRNG (RNG peripheral, see bl_security_seed): each requestSeed
+ * returns 16 random bytes, so a captured (seed,key) pair cannot be replayed —
+ * the next attempt's seed, and therefore its expected AES-CMAC key, differ.
+ * ------------------------------------------------------------------------- */
+#define SEC_SEED_LEN 16u
+#define SEC_KEY_LEN 16u
+
+/* DEMO_SECRET — example key only; MUST be replaced before production use. */
+static const uint8_t DEMO_SECRET[16] = {0xA3, 0xF1, 0x7C, 0x28, 0xB6, 0x4E, 0xD9, 0x05,
+                                        0x71, 0xCC, 0x3A, 0x8F, 0x52, 0x0B, 0xE4, 0x96};
+
+/* ---------------------------------------------------------------------------
+ * H563 RNG (TRNG) — RM0481, accessed via the STM32H5 LL driver
+ *
+ * The RNG control/status/data registers are reached through the CMSIS RNG
+ * instance and the LL RNG inline helpers (LL_RNG_Enable, LL_RNG_IsActiveFlag_
+ * DRDY, LL_RNG_ReadRandData32).  No register addresses are hand-typed.
+ *
+ * The RNG kernel clock is on AHB2; LL_AHB2_GRP1_EnableClock(...PERIPH_RNG)
+ * sets the one RCC clock-gate bit so the peripheral is fed on real silicon.
+ * The firmware otherwise leaves RCC at reset.  The simulator models the RNG as
+ * always clocked, so this write is a harmless no-op there.  The DRDY poll below
+ * is bounded by RNG_DRDY_POLL_MAX, so a stuck/unclocked RNG cannot hang the
+ * bootloader — bl_security_seed returns conditionsNotCorrect instead.
+ * ------------------------------------------------------------------------- */
+
+/* Bound on the per-word DRDY poll so an unclocked/stuck RNG never hangs the
+ * bootloader.  At the 32 MHz reset clock the RNG produces a word every few
+ * microseconds; this loop bound is generous yet finite. */
+#define RNG_DRDY_POLL_MAX 200000u
+
+/* Constant-time comparison to avoid leaking how many bytes matched. */
+static int ct_equal(const uint8_t *a, const uint8_t *b, size_t len)
+{
+    uint8_t diff = 0u;
+    for (size_t i = 0u; i < len; i++) {
+        diff |= (uint8_t) (a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+/*
+ * rng_read_word — read one 32-bit TRNG word with a bounded DRDY poll.
+ *
+ * Returns 1 on success (*out holds a fresh random word), 0 if DRDY never
+ * asserted within RNG_DRDY_POLL_MAX iterations (stuck/unclocked RNG).
+ */
+static int rng_read_word(uint32_t *out)
+{
+    for (uint32_t i = 0u; i < RNG_DRDY_POLL_MAX; i++) {
+        if (LL_RNG_IsActiveFlag_DRDY(RNG) != 0u) {
+            *out = LL_RNG_ReadRandData32(RNG); /* reading DR clears DRDY */
+            return 1;
+        }
+    }
+    return 0; /* timed out — caller treats as conditionsNotCorrect */
+}
+
+static int bl_security_seed(uds_ctx_t *ctx, uint8_t level, uint8_t *seed_buf, uint16_t max_len)
+{
+    (void) ctx;
+    (void) level;
+    if (max_len < SEC_SEED_LEN) {
+        return -(int) 0x22; /* conditionsNotCorrect */
+    }
+
+    /* Enable the RNG kernel clock (AHB2) and the generator. Idempotent: a second
+     * requestSeed simply re-asserts the already-set bits. */
+    LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_RNG);
+    LL_RNG_Enable(RNG);
+
+    /* Draw a fresh 16-byte nonce, one TRNG word at a time, polling DRDY with a
+     * timeout so a stuck RNG cannot hang the SecurityAccess handshake. */
+    for (uint16_t off = 0u; off < SEC_SEED_LEN; off += 4u) {
+        uint32_t word;
+        if (!rng_read_word(&word)) {
+            return -(int) 0x22; /* conditionsNotCorrect: RNG not producing data */
+        }
+        memcpy(&seed_buf[off], &word, sizeof(word));
+    }
+    return (int) SEC_SEED_LEN;
+}
+
+static int bl_security_key(uds_ctx_t *ctx, uint8_t level, const uint8_t *seed, const uint8_t *key,
+                           uint16_t key_len)
+{
+    (void) ctx;
+    (void) level;
+    uint8_t expected[SEC_KEY_LEN];
+
+    if (key_len != SEC_KEY_LEN) {
+        return -(int) 0x35; /* invalidKey: wrong length */
+    }
+
+    if (aes_cmac(DEMO_SECRET, seed, SEC_SEED_LEN, expected) != 0) {
+        return -(int) 0x22; /* conditionsNotCorrect: crypto failure */
+    }
+
+    if (!ct_equal(key, expected, SEC_KEY_LEN)) {
+        return -(int) 0x35; /* invalidKey */
+    }
+    return 0; /* grant security level */
+}
+
+/* ---------------------------------------------------------------------------
+ * Flash / reprogramming state
+ * ------------------------------------------------------------------------- */
+
+/* Bank geometry */
+#define BANK_SIZE 0x100000UL     /* 1 MB per bank */
+#define BL_REGION_SIZE 0x18000UL /* 96 KB bootloader (sectors 0-11) */
+#define SECTOR_SIZE 0x2000UL     /* 8 KB per sector */
+#define SECTORS_PER_BANK 128u    /* 1 MB / 8 KB */
+
+/* First app sector index within a bank */
+#define APP_SECTOR_FIRST 12u
+/* Last app sector index within a bank (inclusive) */
+#define APP_SECTOR_LAST (SECTORS_PER_BANK - 1u)
+
+/* 16-byte staging buffer — H5 requires quad-word aligned program operations */
+#define STAGE_SZ 16u
+
+static struct
+{
+    uint8_t inactive_bank;   /* 0 = bank1, 1 = bank2 */
+    uint32_t app_base;       /* first writable byte of inactive app region */
+    uint32_t app_end;        /* one past last writable byte */
+    uint32_t dl_addr;        /* RequestDownload target base */
+    uint32_t dl_size;        /* RequestDownload declared size */
+    uint32_t write_cursor;   /* next flash address to program */
+    uint32_t bytes_written;  /* total bytes passed to flash (pre-padding) */
+    uint8_t stage[STAGE_SZ]; /* 16-byte alignment staging buffer */
+    uint8_t stage_used;      /* bytes currently in staging buffer */
+    bool dl_active;          /* true between RequestDownload and TransferExit */
+    uint8_t bsc_expected;    /* next expected block-sequence-counter (ISO 14229 §14.3) */
+} g_flash_state;
+
+/* Return bank base address for bank index (0 or 1). */
+static uint32_t bank_base(uint8_t bank)
+{
+    return 0x08000000UL + (uint32_t) bank * BANK_SIZE;
+}
+
+/*
+ * active_app_version — version of the image in the currently-active bank, or 0
+ * if that bank holds no valid image (e.g. first flash / recovery mode).
+ *
+ * This is the anti-rollback "floor": a candidate image whose version is below
+ * this is a downgrade.  Returning 0 when the active bank is invalid disables
+ * enforcement for that activation (recovery must not be bricked) — see the
+ * OTA_ANTIROLLBACK_ENFORCE note in ota_image.h.
+ */
+static uint32_t active_app_version(void)
+{
+    uint8_t active = flash_active_bank();
+    uint32_t active_app = bank_base(active) + BL_REGION_SIZE;
+    if (!app_is_valid(active_app)) {
+        return 0u; /* no current version to compare against */
+    }
+    const ota_image_header_t *hdr = (const ota_image_header_t *) (uintptr_t) active_app;
+    return hdr->version;
+}
+
+/* Flush any accumulated bytes in g_flash_state.stage to flash (pad with 0xFF). */
+static int flush_stage(void)
+{
+    if (g_flash_state.stage_used == 0u) {
+        return 0;
+    }
+    /* Pad the partial block with 0xFF (erased state). */
+    memset(&g_flash_state.stage[g_flash_state.stage_used], 0xFF,
+           STAGE_SZ - g_flash_state.stage_used);
+    int rc = flash_program(g_flash_state.write_cursor, g_flash_state.stage, STAGE_SZ);
+    g_flash_state.write_cursor += STAGE_SZ;
+    g_flash_state.stage_used = 0u;
+    return rc;
+}
+
+/* Erase the app sectors of `bank`, then pre-erase its boot-state sector.
+ *
+ * Pre-erasing the boot-state sector here (during the OTA ERASE phase) is what
+ * makes the later 0xFF02 ActivateSoftware path torn-write-safe: by the time
+ * boot_state_mark_pending() runs the sector is already all-0xFF, so marking
+ * pending is a single atomic quad-word PROGRAM with no erase→program window.
+ * The per-boot attempt slots are programmed into the same pre-erased space. */
+static int erase_app_sectors(uint8_t bank)
+{
+    flash_unlock();
+    for (uint32_t s = APP_SECTOR_FIRST; s <= APP_SECTOR_LAST; s++) {
+        int rc = flash_erase_sector(bank, s);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    /* Pre-erase the inactive bank's boot-state sector for the activate path. */
+    boot_state_prepare(bank_base(bank));
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * UDS flash-service callbacks
+ * ------------------------------------------------------------------------- */
+
+/*
+ * fn_request_download — SID 0x34
+ *
+ * Accept only if [addr, addr+size) lies entirely within the inactive bank's
+ * app region (0x18000–0xFFFFF offset from bank base).  Reject any write into
+ * the bootloader region or the active bank.
+ *
+ * Erases the inactive app sectors here (RequestDownload path; 0xFF00 routine
+ * is an alternative — both are safe to call; the second erase is a no-op on
+ * already-erased flash).
+ */
+static int bl_request_download(uds_ctx_t *ctx, uint32_t addr, uint32_t size)
+{
+    /* Security gate: 0x27 must have been completed before reprogramming. */
+    if (ctx->security.level < 1u) {
+        return -(int) 0x33; /* securityAccessDenied */
+    }
+
+    /*
+     * Alignment gate: the H5 programs flash in 16-byte (quad-word) units, and a
+     * quad-word program whose base is not 16-byte aligned raises INCERR on real
+     * silicon (and in the faithful sim) and commits nothing.  Require a
+     * 16-byte-aligned base so every flushed quad-word lands on an aligned base.
+     * The declared size need NOT be a multiple of 16: flush_stage() pads the
+     * final partial block to a full quad-word with 0xFF.  STAGE_SZ is the
+     * quad-word width (16).
+     */
+    if ((addr % STAGE_SZ) != 0u) {
+        uart_puts("BL: RD reject misaligned\n");
+        return -(int) 0x70; /* uploadDownloadNotAccepted */
+    }
+
+    uint8_t inactive = flash_active_bank() ? 0u : 1u;
+    uint32_t base = bank_base(inactive) + BL_REGION_SIZE;
+    uint32_t end_off = bank_base(inactive) + BANK_SIZE;
+
+    /*
+     * Overflow-safe bounds check: verify size against the fixed region span
+     * BEFORE the addition so a crafted size cannot wrap uint32_t and bypass
+     * the guard.  end_off - base is the app-region span, computed without
+     * overflow.
+     */
+    if (size == 0u || size > (end_off - base) || addr < base || (addr + size) > end_off) {
+        uart_puts("BL: RD reject out-of-range\n");
+        return -(int) 0x70; /* uploadDownloadNotAccepted */
+    }
+
+    /* Erase inactive app region. */
+    uart_puts("BL: erasing inactive app\n");
+    if (erase_app_sectors(inactive) != 0) {
+        return -(int) 0x70;
+    }
+
+    /* Arm the transfer state. */
+    g_flash_state.inactive_bank = inactive;
+    g_flash_state.app_base = base;
+    g_flash_state.app_end = end_off;
+    g_flash_state.dl_addr = addr;
+    g_flash_state.dl_size = size;
+    g_flash_state.write_cursor = addr;
+    g_flash_state.bytes_written = 0u;
+    g_flash_state.stage_used = 0u;
+    g_flash_state.dl_active = true;
+    /* First TransferData block after RequestDownload carries counter 0x01
+     * (ISO 14229-1 §14.3). */
+    g_flash_state.bsc_expected = 0x01u;
+
+    uart_puts("BL: download armed\n");
+    return UDS_OK;
+}
+
+/*
+ * fn_transfer_data — SID 0x36
+ *
+ * Accumulate data in a 16-byte staging buffer; flush full blocks to flash
+ * immediately.  Bounds-check against the declared download region.
+ */
+static int bl_transfer_data(uds_ctx_t *ctx, uint8_t sequence, const uint8_t *data, uint16_t len)
+{
+    /* Security gate: 0x27 must have been completed before reprogramming. */
+    if (ctx->security.level < 1u) {
+        return -(int) 0x33; /* securityAccessDenied */
+    }
+
+    if (!g_flash_state.dl_active) {
+        return -(int) 0x70;
+    }
+
+    /*
+     * Block-sequence-counter enforcement (ISO 14229-1 §14.3).
+     *
+     * The first block after RequestDownload carries counter 0x01; thereafter the
+     * counter increments per accepted block and wraps 0xFF -> 0x00.
+     *   - matching counter  : accept and program (advance expected below)
+     *   - previous counter  : retransmission of the last accepted block — ACK
+     *                         without re-writing flash (idempotent)
+     *   - any other value   : wrongBlockSequenceCounter (NRC 0x73)
+     *
+     * The udslib core verifies the counter as well; duplicating it here keeps the
+     * example's flash side authoritative and torn-write-safe regardless of how the
+     * server core is configured.
+     */
+    uint8_t previous =
+        (g_flash_state.bsc_expected == 0x00u) ? 0xFFu : (uint8_t) (g_flash_state.bsc_expected - 1u);
+
+    if (sequence == previous) {
+        /* Retransmission: data already programmed — ACK without re-writing. */
+        return UDS_OK;
+    }
+    if (sequence != g_flash_state.bsc_expected) {
+        return -(int) 0x73; /* wrongBlockSequenceCounter */
+    }
+
+    /* Bounds check: refuse to write past the declared download region. */
+    if ((g_flash_state.bytes_written + len) > g_flash_state.dl_size) {
+        return -(int) 0x71; /* transferDataSuspended */
+    }
+    if ((g_flash_state.write_cursor + len + g_flash_state.stage_used) > g_flash_state.app_end) {
+        return -(int) 0x71;
+    }
+
+    uint16_t pos = 0u;
+    while (pos < len) {
+        uint8_t space = (uint8_t) (STAGE_SZ - g_flash_state.stage_used);
+        uint16_t chunk = (uint16_t) (len - pos);
+        if (chunk > (uint16_t) space) {
+            chunk = (uint16_t) space;
+        }
+        memcpy(&g_flash_state.stage[g_flash_state.stage_used], data + pos, chunk);
+        g_flash_state.stage_used = (uint8_t) (g_flash_state.stage_used + chunk);
+        pos = (uint16_t) (pos + chunk);
+
+        if (g_flash_state.stage_used == STAGE_SZ) {
+            /* Flush a full staging block. flush_stage() programs exactly
+             * STAGE_SZ bytes (the 0xFF pad is a no-op for a full block) and
+             * advances write_cursor / resets stage_used itself. */
+            int rc = flush_stage();
+            if (rc != 0) {
+                return -(int) 0x72; /* generalProgrammingFailure */
+            }
+        }
+    }
+
+    g_flash_state.bytes_written += len;
+
+    /* Block accepted — advance expected counter (wrap 0xFF -> 0x00). */
+    g_flash_state.bsc_expected =
+        (g_flash_state.bsc_expected == 0xFFu) ? 0x00u : (uint8_t) (g_flash_state.bsc_expected + 1u);
+    return UDS_OK;
+}
+
+/*
+ * fn_transfer_exit — SID 0x37
+ *
+ * Flush any remaining staged bytes (padded to 16 bytes with 0xFF).
+ */
+static int bl_transfer_exit(uds_ctx_t *ctx)
+{
+    /* Security gate: 0x27 must have been completed before reprogramming. */
+    if (ctx->security.level < 1u) {
+        return -(int) 0x33; /* securityAccessDenied */
+    }
+
+    if (!g_flash_state.dl_active) {
+        return -(int) 0x70;
+    }
+
+    int rc = flush_stage();
+    g_flash_state.dl_active = false;
+
+    if (rc != 0) {
+        return -(int) 0x72; /* generalProgrammingFailure */
+    }
+    uart_puts("BL: transfer complete\n");
+    return UDS_OK;
+}
+
+/*
+ * fn_routine_control — SID 0x31
+ *
+ * Routine IDs (matching Vector CANdela naming conventions):
+ *   0xFF00  EraseMemory              — erase inactive-bank app sectors
+ *   0xFF01  CheckProgrammingDependencies — validate OTA header + CRC-32 over payload
+ *   0xFF02  ActivateSoftware         — flash_swap_to_bank_and_reset(inactive) (no return)
+ *   0xFF03  PerformRollback          — tester-commanded revert to the other bank (no return)
+ */
+static int bl_routine_control(uds_ctx_t *ctx, uint8_t type, uint16_t id, const uint8_t *data,
+                              uint16_t len, uint8_t *out_buf, uint16_t max_len)
+{
+    (void) type;
+    (void) data;
+    (void) len;
+    (void) max_len;
+
+    /* Security gate: 0x27 must have been completed before reprogramming. */
+    if (ctx->security.level < 1u) {
+        return -(int) 0x33; /* securityAccessDenied */
+    }
+
+    if (id == 0xFF00u) {
+        /* EraseMemory: erase inactive-bank app sectors.
+         * This is an alternative to the erase done in RequestDownload; calling
+         * it standalone is safe — erasing already-erased flash is a no-op on
+         * the H5. */
+        uint8_t inactive = flash_active_bank() ? 0u : 1u;
+        uart_puts("BL: routine erase\n");
+        int rc = erase_app_sectors(inactive);
+        if (rc != 0) {
+            return -(int) 0x72; /* generalProgrammingFailure */
+        }
+        /*
+         * Reset only transfer-state fields; preserve inactive_bank/app_base/
+         * app_end so they are not transiently zeroed between the erase and the
+         * next RequestDownload.
+         */
+        g_flash_state.dl_active = false;
+        g_flash_state.dl_addr = 0u;
+        g_flash_state.dl_size = 0u;
+        g_flash_state.write_cursor = 0u;
+        g_flash_state.bytes_written = 0u;
+        g_flash_state.stage_used = 0u;
+        memset(g_flash_state.stage, 0, sizeof(g_flash_state.stage));
+        return 0;
+    }
+
+    if (id == 0xFF01u) {
+        /*
+         * CheckProgrammingDependencies:
+         *
+         * Validates the OTA image header written to the inactive bank's app region.
+         * The downloaded image has the form:
+         *   [dl_addr+0x000 .. +0x010)             ota_image_header_t (magic, image_size, crc32,
+         * version) [dl_addr+0x010 .. +0x400)             RESERVED padding (0xFF) [dl_addr+0x400 ..
+         * +0x400+image_size)  app payload
+         *   [.. +0x400+image_size+0x100)          RSA-2048 PKCS#1 v1.5 signature (256B)
+         *
+         * Verification:
+         *   1. header.magic == OTA_IMAGE_MAGIC
+         *   2. header.image_size > 0 && <= OTA_IMAGE_MAX_PAYLOAD
+         *   3. CRC-32/ISO-HDLC over [dl_addr+0x400, dl_addr+0x400+image_size) == header.crc32
+         *   4. RSA-2048 PKCS#1 v1.5 signature over SHA-256(payload) verifies against
+         *      the baked public key (authenticity — rejects forged but CRC-good images)
+         *
+         * Returns 1 byte: 0x01 = PASS, 0x00 = FAIL.
+         */
+        if (g_flash_state.bytes_written < OTA_IMAGE_HDR_SIZE) {
+            /* Not enough data written to hold a header — reject. */
+            return -(int) 0x22; /* conditionsNotCorrect */
+        }
+
+        const ota_image_header_t *hdr =
+            (const ota_image_header_t *) (uintptr_t) g_flash_state.dl_addr;
+
+        /* The full payload AND its trailing signature must have been transferred
+         * before we validate, otherwise verification would run over still-erased
+         * (0xFF) flash. Check image_size first (overflow-safe) then the written
+         * count covering header + payload + 256-byte signature. */
+        if (hdr->image_size > OTA_IMAGE_MAX_PAYLOAD ||
+            g_flash_state.bytes_written <
+                (uint32_t) OTA_IMAGE_HDR_SIZE + hdr->image_size + OTA_IMAGE_SIG_SIZE) {
+            return -(int) 0x22; /* conditionsNotCorrect: incomplete image */
+        }
+
+        /* Validate with the SAME routine the bootloader runs at boot, so a PASS
+         * here guarantees the next-boot app_is_valid() also passes (magic +
+         * size + CRC-32 + RSA signature + initial-SP-in-RAM) — no download/boot
+         * divergence. */
+        uint8_t pass = app_is_valid(g_flash_state.dl_addr) ? 0x01u : 0x00u;
+
+        /*
+         * Anti-rollback (configurable, OTA_ANTIROLLBACK_ENFORCE):
+         * reject a candidate whose version is below the currently-active app's
+         * version.  Enforced here (CheckProgramming) so a downgrade is refused
+         * before ActivateSoftware ever runs; 0xFF02 re-checks as defense in
+         * depth.  Upgrades (>=) always pass.  See ota_image.h.
+         */
+        if (pass) {
+            uint32_t current = active_app_version();
+            uint32_t candidate = hdr->version;
+            if (!ota_version_allows(candidate, current, OTA_ANTIROLLBACK_ENFORCE)) {
+                uart_puts("BL: rollback blocked\n");
+                return -(int) 0x22; /* conditionsNotCorrect: downgrade refused */
+            }
+        }
+
+        if (max_len < 1u) {
+            return -(int) 0x14;
+        }
+        out_buf[0] = pass;
+        if (pass) {
+            uart_puts("BL: image check PASS\n");
+        }
+        else {
+            uart_puts("BL: image check FAIL\n");
+        }
+        return 1;
+    }
+
+    if (id == 0xFF02u) {
+        /*
+         * ActivateSoftware: mark the inactive bank as pending confirmation,
+         * then swap banks and reset.  The pending flag ensures the bootloader
+         * will roll back if the newly-activated app never calls boot_confirm().
+         *
+         * Torn-write safety: the inactive bank's boot-state sector was already
+         * pre-erased during the OTA ERASE phase (erase_app_sectors() / 0xFF00),
+         * so boot_state_mark_pending() here is PROGRAM-ONLY — a single atomic
+         * H5 quad-word.  There is no erase→program window on this path: power
+         * loss either commits the full header (pending=1) or commits nothing.
+         *
+         * Order matters: boot_state_mark_pending() MUST complete before
+         * the swap+reset so the flag is visible on the next boot.
+         * A power loss after mark_pending but before swap keeps the CURRENT
+         * bank active; the inactive bank's pending flag is benign there
+         * (it is never the active bank until a successful swap).
+         *
+         * Use flash_swap_to_bank_and_reset(target) — which SETS/CLEARS
+         * SWAP_BANK to select the target explicitly — rather than the OR-only
+         * flash_set_swap_and_reset(), so activation works from EITHER bank
+         * (the 2nd OTA activates from bank 1 → bank 0, which the OR form
+         * cannot express).
+         */
+        uint8_t active = flash_active_bank();
+        uint8_t inactive = active ? 0u : 1u;
+        uint32_t inactive_base = 0x08000000UL + (uint32_t) inactive * 0x100000UL;
+
+        /* Re-validate the inactive image (CRC + RSA signature) immediately
+         * before committing the swap. CheckProgramming (0xFF01) already ran the
+         * same check, but re-running it here closes the activate-without-
+         * revalidation hole: nothing may swap to a bank that does not currently
+         * hold an authentic, CRC-good image. */
+        uint32_t inactive_app = inactive_base + BL_REGION_SIZE;
+        if (!app_is_valid(inactive_app)) {
+            uart_puts("BL: activate refused — inactive image invalid\n");
+            return -(int) 0x22; /* conditionsNotCorrect */
+        }
+
+        /* Anti-rollback re-check (defense in depth, see 0xFF01 and ota_image.h):
+         * refuse to swap to an image older than the currently-active one. */
+        {
+            const ota_image_header_t *cand = (const ota_image_header_t *) (uintptr_t) inactive_app;
+            if (!ota_version_allows(cand->version, active_app_version(),
+                                    OTA_ANTIROLLBACK_ENFORCE)) {
+                uart_puts("BL: rollback blocked\n");
+                return -(int) 0x22; /* conditionsNotCorrect: downgrade refused */
+            }
+        }
+
+        uart_puts("BL: marking inactive bank pending\n");
+        boot_state_mark_pending(inactive_base);
+        uart_puts("BL: activate software\n");
+        flash_swap_to_bank_and_reset(inactive);
+        /* flash_swap_to_bank_and_reset() issues a system reset; unreachable below. */
+        for (;;) {
+        }
+    }
+
+    if (id == 0xFF03u) {
+        /*
+         * PerformRollback: tester-commanded revert to the other (currently
+         * inactive) bank.
+         *
+         * This is distinct from the automatic boot-confirm rollback:
+         *   - Automatic rollback fires when an unconfirmed app exhausts its
+         *     MAX_BOOT_ATTEMPTS budget; the bootloader decides entirely on its
+         *     own.
+         *   - PerformRollback is explicitly commanded by a tester/diagnostic
+         *     tool over UDS, e.g. to undo a successful activation and revert to
+         *     the previously-known-good image on demand.
+         *
+         * Safety guard: validate the other bank before swapping.  Refusing to
+         * roll back into an empty or corrupt bank prevents bricking the device
+         * on a malformed tester command.
+         *
+         * Boot-state handling: the other bank is the previously-active
+         * known-good bank; it was never marked pending by ActivateSoftware
+         * (which only marks the INACTIVE bank).  Its boot-state sector is
+         * therefore already confirmed (or erased = safe default).  We clear it
+         * explicitly here to guarantee a clean state, mirroring the automatic
+         * rollback path (boot_state_clear before flash_set_swap_and_reset in
+         * the auto-rollback path in main()).
+         *
+         * Order: clear other-bank boot state → print milestone → swap+reset.
+         * A power loss after clear but before swap leaves the current bank
+         * active; on the next boot the tester can retry.
+         */
+        uint8_t active = flash_active_bank();
+        uint8_t other = active ? 0u : 1u;
+        uint32_t other_base = 0x08000000UL + (uint32_t) other * 0x100000UL;
+        uint32_t other_app = other_base + BL_REGION_SIZE;
+
+        /* Refuse rollback if the other bank does not hold a bootable image. */
+        if (!app_is_valid(other_app)) {
+            uart_puts("BL: rollback refused — other bank invalid\n");
+            return -(int) 0x22; /* conditionsNotCorrect */
+        }
+
+        /* Clear the other bank's boot-state so it is treated as confirmed. */
+        boot_state_clear(other_base);
+
+        uart_puts("BL: perform rollback\n");
+        flash_swap_to_bank_and_reset(other);
+        /* flash_swap_to_bank_and_reset() issues a system reset; unreachable. */
+        for (;;) {
+        }
+    }
+
+    return -(int) 0x31; /* requestOutOfRange */
+}
+
+/* ---------------------------------------------------------------------------
+ * Communication Control (0x28) and DTC Setting (0x85)
+ *
+ * A robust reprogramming sequence quiets the bus before it erases and flashes:
+ *   - 0x28 CommunicationControl disables normal application messaging so the
+ *     ECU stops emitting periodic app traffic while it is being flashed.
+ *   - 0x85 ControlDTCSetting freezes DTC storage so the faults that flashing
+ *     naturally provokes (missing app, bus-off peers) are not logged.
+ * The host flash tool issues both right after entering the programming session
+ * and the matching re-enable is implicit: returning to the default session
+ * (10 01) restores communication and DTC setting in the server core, so a
+ * tester that resets the link recovers the defaults automatically.
+ *
+ * These booleans mirror the state for the UART trace; the authoritative state
+ * lives in the UDS session (ctx->session.comm_state / dtc_setting_disabled).
+ * ------------------------------------------------------------------------- */
+static bool g_app_msgs_enabled = true;
+static bool g_dtc_enabled = true;
+
+/* fn_comm_control — SID 0x28. Disable normal application messages for the
+ * control types that silence transmission; re-enable for the normal/Tx-enabling
+ * types. The core has already validated the sub-function and communicationType. */
+static int bl_comm_control(uds_ctx_t *ctx, uint8_t ctrl_type, uint8_t comm_type, uint16_t node_id)
+{
+    (void) ctx;
+    (void) comm_type;
+    (void) node_id;
+    g_app_msgs_enabled = (ctrl_type == UDS_COMM_ENABLE_RX_TX) ||
+                         (ctrl_type == UDS_COMM_DISABLE_RX_ENABLE_TX) ||
+                         (ctrl_type == UDS_COMM_ENABLE_RX_TX_ENH);
+    uart_puts(g_app_msgs_enabled ? "BL: app messages enabled\n" : "BL: app messages disabled\n");
+    return UDS_OK;
+}
+
+/* fn_control_dtc_setting — SID 0x85. sub 0x01 = DTC setting on, 0x02 = off. */
+static int bl_control_dtc_setting(uds_ctx_t *ctx, uint8_t sub_function)
+{
+    (void) ctx;
+    g_dtc_enabled = (sub_function == 0x01u);
+    uart_puts(g_dtc_enabled ? "BL: DTC setting on\n" : "BL: DTC setting off\n");
+    return UDS_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * DID table — 0xF1A0: active bank indicator (1 byte, read-only, all sessions)
+ *
+ * Deliberately readable in any session with no security access. The value is a
+ * single bank number (0 or 1) the host flash tool needs to compute the INACTIVE
+ * app base before it can request a download. It leaks no secret and exposes no
+ * write path — it is a diagnostic/orchestration aid, not an attack surface — so
+ * gating it behind security would only add friction for legitimate flashing.
+ * ------------------------------------------------------------------------- */
+static int bl_read_did(uds_ctx_t *ctx, uint16_t did, uint8_t *buf, uint16_t max_len)
+{
+    (void) ctx;
+    if (did == 0xF1A0u && max_len >= 1u) {
+        buf[0] = flash_active_bank();
+        return 1;
+    }
+    return -(int) 0x31; /* requestOutOfRange */
+}
+
+static const uds_did_entry_t g_did_table[] = {{0xF1A0u, 1u, 0u, 0u, bl_read_did, NULL, NULL}};
+
+/* ---------------------------------------------------------------------------
+ * UDS context
+ * ------------------------------------------------------------------------- */
+static uds_ctx_t g_uds;
+static uint8_t g_rx_buf[512];
+static uint8_t g_tx_buf[512];
+
+/* ---------------------------------------------------------------------------
+ * main
+ * ------------------------------------------------------------------------- */
+int main(void)
+{
+    uart_init();
+    systick_init(); /* start the 1 ms SysTick time base for UDS timing */
+    uart_puts("BL-START\n");
+
+    /*
+     * Boot decision with confirmation and automatic rollback.
+     *
+     * After ActivateSoftware swaps banks the newly-active bank is "pending":
+     * it must confirm itself (by erasing its boot-state sector) within
+     * MAX_BOOT_ATTEMPTS attempts.  A freshly-activated app that reboots
+     * without confirming is rolled back to the previous (known-good) bank.
+     *
+     * State machine (boot_state_decide() in boot_state.h):
+     *   JUMP         — bank confirmed or no record; validate image and jump.
+     *   BUMP_AND_JUMP — bank on-trial; increment attempt counter, then jump.
+     *   ROLLBACK     — attempt limit reached; clear pending flag, swap back.
+     *
+     * Safety properties:
+     *   - Power-loss during download: inactive bank header check fails on
+     *     next boot → BL-RECOVERY (existing behaviour, unchanged).
+     *   - Torn-write safety: the activate/boot path issues only single atomic
+     *     H5 quad-word PROGRAMs (the boot-state sector is pre-erased during the
+     *     OTA ERASE phase). mark_pending either fully commits pending=1 or
+     *     nothing; a per-boot attempt slot either commits or leaves the prior
+     *     count. A power loss can therefore never erase the pending flag and
+     *     never make an unconfirmed bank look confirmed — rollback survives.
+     *   - Rolled-back-to bank must not be pending: ActivateSoftware only
+     *     marks the INACTIVE bank before swapping, so the prior known-good
+     *     bank never has its boot-state touched.
+     */
+    {
+        uint8_t active_bank = flash_active_bank();
+        uint32_t active_base = 0x08000000UL + (uint32_t) active_bank * 0x100000UL;
+        uint32_t active_app_base = active_base + 0x18000UL;
+
+        boot_state_t bs;
+        boot_state_read(active_base, &bs);
+
+        boot_decision_t decision = boot_state_decide(&bs, MAX_BOOT_ATTEMPTS);
+
+        if (decision == BOOT_DECISION_ROLLBACK) {
+            uart_puts("BL-ROLLBACK\n");
+            /* Clear the pending flag BEFORE swapping so the active bank is
+             * clean; if we lose power here the bank stays current and the
+             * next boot restarts the rollback decision (safe: rollback again). */
+            boot_state_clear(active_base);
+            /* Swap back to the other bank (the known-good one). */
+            flash_set_swap_and_reset(); /* does not return */
+            for (;;) {
+            }
+        }
+
+        if (decision == BOOT_DECISION_BUMP_AND_JUMP) {
+            /* Count this attempt before jumping so a crash/watchdog reset
+             * is recorded even if the app never runs. */
+            boot_state_bump_attempts(active_base);
+        }
+
+        /* Validate the image header + CRC before jumping. */
+        if (app_is_valid(active_app_base)) {
+            uart_puts("BL-JUMP\n");
+            app_jump(active_app_base); /* does not return */
+        }
+        uart_puts("BL-RECOVERY\n");
+    }
+
+    /* Start FDCAN in loopback mode (self-test / simulation). */
+    fdcan_start();
+
+    /* ISO-TP FD: TX=0x7E8, RX=0x7E0 (standard OBD diagnostic IDs). */
+    uds_tp_isotp_init(&g_isotp, can_send, BL_TX_ID, BL_RX_ID, g_isotp_tx_sdu,
+                      (uint16_t) sizeof(g_isotp_tx_sdu));
+    uds_tp_isotp_set_fd(&g_isotp, true);
+
+    /* Configure the UDS server. */
+    uds_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.ecu_address = 0x10u;
+    cfg.get_time_ms = get_time_ms;
+    cfg.fn_tp_send = isotp_send_adapter;
+    cfg.p2_ms = 50u;
+    cfg.p2_star_ms = 5000u;
+    cfg.rx_buffer = g_rx_buf;
+    cfg.rx_buffer_size = (uint16_t) sizeof(g_rx_buf);
+    cfg.tx_buffer = g_tx_buf;
+    cfg.tx_buffer_size = (uint16_t) sizeof(g_tx_buf);
+
+    /* DID table: 0xF1A0 active bank indicator. */
+    cfg.did_table.entries = g_did_table;
+    cfg.did_table.count = 1u;
+
+    /* Gate reprogramming services (0x34/0x36/0x37/0x31/0x27) to the
+     * programming session (ISO 14229-1 sensible defaults). */
+    cfg.restrict_sessions = true;
+
+    /* 0x27 Security Access via AES-128-CMAC (DEMO key — see DEMO_SECRET). */
+    cfg.fn_security_seed = bl_security_seed;
+    cfg.fn_security_key = bl_security_key;
+    cfg.security_max_attempts = 3u;
+    cfg.security_delay_ms = 10000u;
+
+    /* Flash reprogramming callbacks. */
+    cfg.fn_request_download = bl_request_download;
+    cfg.fn_transfer_data = bl_transfer_data;
+    cfg.fn_transfer_exit = bl_transfer_exit;
+    cfg.fn_routine_control = bl_routine_control;
+
+    /* 0x28 CommunicationControl + 0x85 ControlDTCSetting: quiet the bus and
+     * freeze DTC storage during reprogramming. Gated to the extended/programming
+     * session by restrict_sessions; returning to the default session restores
+     * both. */
+    cfg.fn_comm_control = bl_comm_control;
+    cfg.fn_control_dtc_setting = bl_control_dtc_setting;
+
+    if (uds_init(&g_uds, &cfg) != UDS_OK) {
+        uart_puts("BL: uds_init FAIL\n");
+        for (;;) {
+        }
+    }
+
+    uart_puts("BL: UDS server ready\n");
+
+#ifdef SIM_OTA_TESTER
+    /* The tester reads the per-attempt seed from the server's 0x67 01 response
+     * and computes the key live, so no static seed is passed (NULL). */
+    sim_tester_init(DEMO_SECRET, NULL);
+#endif
+
+    /* Polling loop — no NVIC IRQs. */
+    for (;;) {
+        /* Pump incoming CAN frames into the ISO-TP layer. */
+        can_frame_t frame;
+        while (fdcan_poll_rx_frame(&frame)) {
+            if (frame.id == BL_RX_ID) {
+                uds_isotp_rx_callback(&g_isotp, &g_uds, frame.id, frame.data, frame.len);
+            }
+#ifdef SIM_OTA_TESTER
+            else if (frame.id == BL_TX_ID) {
+                sim_tester_rx(frame.data, frame.len);
+            }
+#endif
+        }
+
+        /* Run the UDS service dispatcher. */
+        uds_process(&g_uds);
+
+        /* Advance ISO-TP timers and drive multi-frame TX. */
+        uds_tp_isotp_process(&g_isotp, g_now_ms);
+
+#ifdef SIM_OTA_TESTER
+        sim_tester_poll();
+#endif
+    }
+}

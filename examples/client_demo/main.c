@@ -1,0 +1,163 @@
+/*
+ * Copyright (c) 2026 Andrii Shylenko
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ */
+
+/**
+ * @file main.c
+ * @brief UDS Client Demo
+ */
+
+#include "uds/uds_core.h"
+#include "uds/uds_client.h"
+#include "uds/uds_isotp.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <time.h>
+
+#pragma pack(push, 1)
+typedef struct
+{
+    uint32_t id;
+    uint8_t data[64];
+    uint8_t len;
+} vcan_packet_t;
+#pragma pack(pop)
+
+static int sock_fd = -1;
+static struct sockaddr_in server_addr;
+
+uint32_t get_time_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
+
+int mock_can_send(uint32_t id, const uint8_t* data, uint8_t len)
+{
+    vcan_packet_t pkt;
+    pkt.id = id;
+    pkt.len = len;
+    memcpy(pkt.data, data, len);
+    sendto(sock_fd, &pkt, sizeof(pkt), 0, (struct sockaddr*) &server_addr, sizeof(server_addr));
+    return 0;
+}
+
+/** ISO-TP transport instance and its multi-frame TX cache. */
+static uds_isotp_ctx_t g_isotp;
+static uint8_t g_isotp_tx_sdu[1024];
+
+/** Adapter binding the core's fn_tp_send contract to this ISO-TP instance. */
+static int isotp_send_adapter(struct uds_ctx* ctx, const uint8_t* data, uint16_t len)
+{
+    (void) ctx;
+    return uds_isotp_send(&g_isotp, data, len);
+}
+
+void on_response(uds_client_ctx_t* c, uint8_t sid, const uint8_t* data, uint16_t len)
+{
+    (void) c;
+    printf("[CLIENT] Response Received: SID=%02X, Len=%d\n", sid, len);
+    printf("[CLIENT] Data:");
+    for (int i = 0; i < len; i++) printf(" %02X", data[i]);
+    printf("\n");
+
+    if (sid == 0x50) printf("[CLIENT] Session changed OK\n");
+    if (sid == 0x62) printf("[CLIENT] Read Data OK\n");
+}
+
+/* ISO-TP delivers a reassembled response SDU here; route it to the client. */
+static void on_sdu_to_client(void* cookie, const uint8_t* sdu, uint16_t len, uint8_t addr)
+{
+    (void) addr;
+    if (len == 0u) return;
+    uds_client_handle_response((uds_client_ctx_t*) cookie, sdu[0], sdu, len);
+}
+
+int main(int argc, char** argv)
+{
+    const char* target_ip = "127.0.0.1";
+    int port = 5000;
+    int enable_fd = 1; /* Default to CAN-FD */
+
+    if (argc > 1) target_ip = argv[1];
+    if (argc > 2) port = atoi(argv[2]);
+    if (argc > 3) enable_fd = atoi(argv[3]);
+
+    printf("UDS Client starting (Target: %s:%d) [CAN-FD: %d]\n", target_ip, port, enable_fd);
+
+    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    inet_pton(AF_INET, target_ip, &server_addr.sin_addr);
+
+    // TX: 0x7E0, RX: 0x7E8
+    uds_tp_isotp_init(&g_isotp, mock_can_send, 0x7E0, 0x7E8, g_isotp_tx_sdu,
+                      sizeof(g_isotp_tx_sdu));
+    uds_tp_isotp_set_fd(&g_isotp, enable_fd != 0);
+
+    uint8_t rx_buf[1024], tx_buf[1024];
+    uds_config_t cfg = {.get_time_ms = get_time_ms,
+                        .fn_tp_send = isotp_send_adapter,
+                        .rx_buffer = rx_buf,
+                        .rx_buffer_size = sizeof(rx_buf),
+                        .tx_buffer = tx_buf,
+                        .tx_buffer_size = sizeof(tx_buf),
+                        .fn_log = NULL};
+
+    /* The uds_ctx holds the transport config (rx/tx buffers, clock) used by the
+     * ISO-TP reassembly; it is never dispatched as a server here. */
+    uds_ctx_t ctx;
+    uds_init(&ctx, &cfg);
+
+    /* Client role: separate context sharing the same transport config. */
+    uds_client_ctx_t client = {.config = &cfg, .pending_sid = 0, .cb = NULL};
+    uds_isotp_set_sdu_handler(&g_isotp, on_sdu_to_client, &client);
+
+    // 1. Send Request
+    printf("[CLIENT] Sending DiagnosticSessionControl (Extended)...\n");
+    uint8_t sub = 0x03;
+    uds_client_request(&client, 0x10, &sub, 1, on_response);
+
+    // 2. Loop until response or timeout
+    uint32_t start = get_time_ms();
+    while (get_time_ms() - start < 1000) {
+        uds_process(&ctx);
+        uds_tp_isotp_process(&g_isotp, get_time_ms());
+
+        // Non-blocking recv
+        struct timeval tv = {0, 1000};
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        vcan_packet_t pkt;
+        struct sockaddr_in from;
+        socklen_t flen = sizeof(from);
+        if (recvfrom(sock_fd, &pkt, sizeof(pkt), 0, (struct sockaddr*) &from, &flen) > 0) {
+            uds_isotp_rx_callback(&g_isotp, &ctx, pkt.id, pkt.data, pkt.len);
+        }
+    }
+
+    // 3. Send Another Request
+    printf("\n[CLIENT] Sending ReadDataByIdentifier (VIN)...\n");
+    uint8_t did[] = {0xF1, 0x90};
+    uds_client_request(&client, 0x22, did, 2, on_response);
+
+    start = get_time_ms();
+    while (get_time_ms() - start < 1000) {
+        uds_process(&ctx);
+        uds_tp_isotp_process(&g_isotp, get_time_ms());
+
+        vcan_packet_t pkt;
+        if (recv(sock_fd, &pkt, sizeof(pkt), MSG_DONTWAIT) > 0) {
+            uds_isotp_rx_callback(&g_isotp, &ctx, pkt.id, pkt.data, pkt.len);
+        }
+        usleep(100);
+    }
+
+    return 0;
+}

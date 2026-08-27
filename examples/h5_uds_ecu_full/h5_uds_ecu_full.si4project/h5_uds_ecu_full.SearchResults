@@ -1,0 +1,6 @@
+---- cfg.fn_reset Matches (5 in 3 files) ----
+main in main.c (firmware) :     cfg.fn_reset = fn_reset;
+{anonuds_config_t} in uds_config.h (D:\STM32C092RC\udslib\include\uds) :     uds_reset_fn fn_reset;
+{anonuds_config_t} in uds_config.h (D:\STM32C092RC\udslib\include\uds) :      *  Gates fn_reset so a rebooting reset cannot drop the response. */
+uds_internal_run_posttx_action in uds_core.c (D:\STM32C092RC\udslib\src\core) :             if (ctx->config->fn_reset != NULL) {
+uds_internal_run_posttx_action in uds_core.c (D:\STM32C092RC\udslib\src\core) :                 ctx->config->fn_reset(ctx, arg);

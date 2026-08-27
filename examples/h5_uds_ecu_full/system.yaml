@@ -1,0 +1,4 @@
+name: "h5-uds-ecu-full"
+chip: "stm32h563.yaml"
+external_devices: []
+board_io: []
